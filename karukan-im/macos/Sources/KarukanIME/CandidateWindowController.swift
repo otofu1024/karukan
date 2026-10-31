@@ -171,7 +171,7 @@ class CandidateWindowController {
         numberColumn.translatesAutoresizingMaskIntoConstraints = false
         numberColumn.addSubview(numberLabel)
         NSLayoutConstraint.activate([
-            numberColumn.widthAnchor.constraint(equalToConstant: 24),
+            numberColumn.widthAnchor.constraint(equalToConstant: 14),
             numberColumn.heightAnchor.constraint(equalToConstant: 21),
             numberLabel.centerXAnchor.constraint(equalTo: numberColumn.centerXAnchor),
             numberLabel.centerYAnchor.constraint(equalTo: numberColumn.centerYAnchor),
@@ -205,8 +205,8 @@ class CandidateWindowController {
         row.orientation = .horizontal
         row.alignment = .centerY
         row.distribution = .fill
-        row.spacing = 10
-        row.edgeInsets = NSEdgeInsets(top: 3, left: 10, bottom: 3, right: 10)
+        row.spacing = 6
+        row.edgeInsets = NSEdgeInsets(top: 3, left: 6, bottom: 3, right: 10)
         row.wantsLayer = true
         row.layer?.cornerRadius = 8
         row.layer?.masksToBounds = true
