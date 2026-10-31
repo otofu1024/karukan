@@ -36,7 +36,19 @@ class CandidateWindowController {
 
     private let panel: NSPanel
     private let stackView: NSStackView
-    private var rowViews: [NSView] = []
+    private struct CandidateRow {
+        let view: NSStackView
+        let numberLabel: NSTextField
+        let candidateLabel: NSTextField
+        var candidate: CandidateItem?
+        var selected: Bool?
+    }
+    private var rowViews: [CandidateRow] = []
+    private let footerSeparator = NSBox()
+    private let footerLabel = NSTextField(labelWithString: "")
+    private var renderedFooter: String?
+    private var renderedAppearance: NSAppearance.Name?
+    private var symbolImages: [String: NSImage] = [:]
     private var auxText: String?
 
     private struct PageState {
@@ -88,6 +100,11 @@ class CandidateWindowController {
                 stackView.bottomAnchor.constraint(equalTo: contentView.bottomAnchor),
             ])
         }
+        footerSeparator.boxType = .separator
+        footerSeparator.translatesAutoresizingMaskIntoConstraints = false
+        footerSeparator.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        footerLabel.translatesAutoresizingMaskIntoConstraints = false
+        footerLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
     }
 
     var isVisible: Bool { panel.isVisible }
@@ -121,7 +138,6 @@ class CandidateWindowController {
     }
 
     private func render(cursorRect: NSRect?) {
-        clearRows()
         guard let state = pageState else {
             hide()
             return
@@ -134,8 +150,55 @@ class CandidateWindowController {
             return
         }
 
+        let appearance = panel.effectiveAppearance.bestMatch(from: [.darkAqua, .aqua])
+        let appearanceChanged = renderedAppearance != appearance
+        if appearanceChanged {
+            symbolImages.removeAll()
+            renderedAppearance = appearance
+        }
+        var layoutChanged = rowViews.count != state.candidates.count
+        while rowViews.count > state.candidates.count {
+            let row = rowViews.removeLast()
+            stackView.removeArrangedSubview(row.view)
+            row.view.removeFromSuperview()
+        }
+        while rowViews.count < state.candidates.count {
+            let row = addCandidateRow(number: rowViews.count + 1)
+            rowViews.append(row)
+        }
         for (index, candidate) in state.candidates.enumerated() {
-            addCandidateRow(candidate, number: index + 1, selected: index == state.cursor)
+            var row = rowViews[index]
+            if row.candidate?.text != candidate.text
+                || row.candidate?.description != candidate.description
+            {
+                let text = NSMutableAttributedString(
+                    string: candidate.text,
+                    attributes: [
+                        .font: NSFont.systemFont(ofSize: Self.candidateFontSize),
+                        .foregroundColor: NSColor.labelColor,
+                    ])
+                if let description = candidate.description {
+                    text.append(NSAttributedString(
+                        string: "  \(description)",
+                        attributes: [
+                            .font: NSFont.systemFont(ofSize: Self.footerFontSize),
+                            .foregroundColor: NSColor.secondaryLabelColor,
+                        ]))
+                }
+                row.candidateLabel.attributedStringValue = text
+                row.candidate = candidate
+                layoutChanged = true
+            }
+            let selected = index == state.cursor
+            if row.selected != selected || appearanceChanged {
+                row.numberLabel.textColor = selected ? .labelColor : .secondaryLabelColor
+                panel.effectiveAppearance.performAsCurrentDrawingAppearance {
+                    row.view.layer?.backgroundColor = selected
+                        ? Self.selectionColor.cgColor : NSColor.clear.cgColor
+                }
+                row.selected = selected
+            }
+            rowViews[index] = row
         }
         var footer = auxText ?? ""
         if state.totalPages > 1 {
@@ -144,27 +207,35 @@ class CandidateWindowController {
                 footer = footer.isEmpty ? page : "\(footer) \(page)"
             }
         }
-        if !footer.isEmpty {
-            addFooterSeparator()
-            addFooterLabel(footer)
+        if renderedFooter != footer || appearanceChanged {
+            if !footer.isEmpty {
+                footerLabel.attributedStringValue = styledFooter(footer)
+                if footerLabel.superview == nil {
+                    for view in [footerSeparator, footerLabel] {
+                        stackView.addArrangedSubview(view)
+                        view.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -16)
+                            .isActive = true
+                    }
+                }
+            } else if footerLabel.superview != nil {
+                for view in [footerSeparator, footerLabel] {
+                    stackView.removeArrangedSubview(view)
+                    view.removeFromSuperview()
+                }
+            }
+            renderedFooter = footer
+            layoutChanged = true
         }
 
-        positionPanel(cursorRect: cursorRect)
-    }
-
-    private func clearRows() {
-        for view in rowViews {
-            stackView.removeArrangedSubview(view)
-            view.removeFromSuperview()
+        if layoutChanged || cursorRect != nil || !panel.isVisible {
+            positionPanel(cursorRect: cursorRect)
         }
-        rowViews.removeAll()
     }
 
-    private func addCandidateRow(_ candidate: CandidateItem, number: Int, selected: Bool) {
+    private func addCandidateRow(number: Int) -> CandidateRow {
         let numberLabel = NSTextField(labelWithString: "\(number)")
         numberLabel.font = NSFont.systemFont(ofSize: Self.numberFontSize)
         numberLabel.alignment = .center
-        numberLabel.textColor = selected ? .labelColor : .secondaryLabelColor
         numberLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let numberColumn = NSView()
@@ -177,25 +248,7 @@ class CandidateWindowController {
             numberLabel.centerYAnchor.constraint(equalTo: numberColumn.centerYAnchor),
         ])
 
-        let text = NSMutableAttributedString(
-            string: candidate.text,
-            attributes: [
-                .font: NSFont.systemFont(ofSize: Self.candidateFontSize),
-                .foregroundColor: NSColor.labelColor,
-            ]
-        )
-        if let description = candidate.description {
-            text.append(
-                NSAttributedString(
-                    string: "  \(description)",
-                    attributes: [
-                        .font: NSFont.systemFont(ofSize: Self.footerFontSize),
-                        .foregroundColor: NSColor.secondaryLabelColor,
-                    ]
-                ))
-        }
-
-        let candidateLabel = NSTextField(labelWithAttributedString: text)
+        let candidateLabel = NSTextField(labelWithString: "")
         candidateLabel.translatesAutoresizingMaskIntoConstraints = false
         candidateLabel.alignment = .left
         candidateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
@@ -210,34 +263,12 @@ class CandidateWindowController {
         row.wantsLayer = true
         row.layer?.cornerRadius = 8
         row.layer?.masksToBounds = true
-        panel.effectiveAppearance.performAsCurrentDrawingAppearance {
-            row.layer?.backgroundColor = selected ? Self.selectionColor.cgColor : NSColor.clear.cgColor
-        }
-        stackView.addArrangedSubview(row)
+        stackView.insertArrangedSubview(row, at: rowViews.count)
         row.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -16).isActive = true
-        rowViews.append(row)
+        return CandidateRow(view: row, numberLabel: numberLabel, candidateLabel: candidateLabel)
     }
 
-    private func addFooterSeparator() {
-        let separator = NSBox()
-        separator.boxType = .separator
-        separator.translatesAutoresizingMaskIntoConstraints = false
-        separator.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        stackView.addArrangedSubview(separator)
-        separator.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -16).isActive = true
-        rowViews.append(separator)
-    }
-
-    private func addFooterLabel(_ text: String) {
-        let label = NSTextField(labelWithAttributedString: Self.styledFooter(text))
-        label.translatesAutoresizingMaskIntoConstraints = false
-        label.setContentCompressionResistancePriority(.required, for: .horizontal)
-        stackView.addArrangedSubview(label)
-        label.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -16).isActive = true
-        rowViews.append(label)
-    }
-
-    private static func styledFooter(_ text: String) -> NSAttributedString {
+    private func styledFooter(_ text: String) -> NSAttributedString {
         var text = text
         if text.hasPrefix("⚡") {
             text.removeFirst()
@@ -246,7 +277,7 @@ class CandidateWindowController {
         let source = text as NSString
         var symbols: [(NSRange, String, String)] = []
         // Match engine metadata tokens, preserving emoji in the user's reading and context.
-        for (emoji, label, symbol) in sourceSymbols {
+        for (emoji, label, symbol) in Self.sourceSymbols {
             for token in ["[変換:\(emoji)]", "| \(emoji) \(label)"] {
                 let tokenRange = source.range(of: token, options: .backwards)
                 if tokenRange.location != NSNotFound {
@@ -263,16 +294,21 @@ class CandidateWindowController {
                 symbols.append((source.range(of: "🎯", range: range), "scope", "変換範囲"))
             }
         }
-        let font = NSFont.systemFont(ofSize: footerFontSize)
+        let font = NSFont.systemFont(ofSize: Self.footerFontSize)
         let result = NSMutableAttributedString(
             string: text, attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
-        let configuration = NSImage.SymbolConfiguration(pointSize: footerFontSize, weight: .regular)
-            .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
         for (range, symbol, description) in symbols.sorted(by: { $0.0.location > $1.0.location }) {
+            if symbolImages[symbol] == nil {
+                let configuration = NSImage.SymbolConfiguration(pointSize: Self.footerFontSize, weight: .regular)
+                    .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
+                panel.effectiveAppearance.performAsCurrentDrawingAppearance {
+                    symbolImages[symbol] = NSImage(systemSymbolName: symbol, accessibilityDescription: description)?
+                        .withSymbolConfiguration(configuration)
+                }
+            }
             let attachment = NSTextAttachment()
-            attachment.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)?
-                .withSymbolConfiguration(configuration)
-            attachment.bounds = NSRect(x: 0, y: -2, width: footerFontSize, height: footerFontSize)
+            attachment.image = symbolImages[symbol]
+            attachment.bounds = NSRect(x: 0, y: -2, width: Self.footerFontSize, height: Self.footerFontSize)
             result.replaceCharacters(in: range, with: NSAttributedString(attachment: attachment))
         }
         return result
@@ -291,32 +327,21 @@ class CandidateWindowController {
         let panelWidth = max(ceil(contentSize.width) + 2, Self.minPanelWidth)
         let panelHeight = ceil(contentSize.height) + 2
 
-        guard cursorRect != .zero else {
-            panel.setFrame(
-                NSRect(x: 100, y: 100, width: panelWidth, height: panelHeight), display: true)
+        var frame = NSRect(x: 100, y: 100, width: panelWidth, height: panelHeight)
+        if cursorRect != .zero {
+            // Flip above the cursor when the panel would fall off the bottom of the screen.
+            let showAbove = NSScreen.main.map {
+                cursorRect.origin.y - panelHeight < $0.visibleFrame.origin.y
+            } ?? false
+            frame.origin = NSPoint(
+                x: cursorRect.origin.x,
+                y: showAbove ? cursorRect.maxY : cursorRect.origin.y - panelHeight)
+        }
+        if panel.frame != frame {
+            panel.setFrame(frame, display: true)
+        }
+        if !panel.isVisible {
             panel.orderFront(nil)
-            return
         }
-
-        // Flip above the cursor when the panel would fall off the bottom of
-        // the screen.
-        let showAbove: Bool
-        if let screen = NSScreen.main {
-            showAbove = cursorRect.origin.y - panelHeight < screen.visibleFrame.origin.y
-        } else {
-            showAbove = false
-        }
-
-        let originY: CGFloat
-        if showAbove {
-            originY = cursorRect.origin.y + cursorRect.size.height
-        } else {
-            originY = cursorRect.origin.y - panelHeight
-        }
-
-        panel.setFrame(
-            NSRect(x: cursorRect.origin.x, y: originY, width: panelWidth, height: panelHeight),
-            display: true)
-        panel.orderFront(nil)
     }
 }
