@@ -8,9 +8,31 @@ import Cocoa
 class CandidateWindowController {
     private static let candidateFontSize: CGFloat = 18
     private static let footerFontSize: CGFloat = 13
-    private static let badgeFontSize: CGFloat = 13
+    private static let numberFontSize: CGFloat = 13
     private static let minPanelWidth: CGFloat = 160
-    private static let accentColor = NSColor.systemBlue
+    private static let backgroundColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.07, green: 0.08, blue: 0.09, alpha: 0.98)
+            : NSColor(calibratedWhite: 0.985, alpha: 0.98)
+    }
+    private static let selectionColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.14, green: 0.17, blue: 0.23, alpha: 1)
+            : NSColor(srgbRed: 0.90, green: 0.93, blue: 0.97, alpha: 1)
+    }
+    private static let borderColor = NSColor(name: nil) { appearance in
+        appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+            ? NSColor(srgbRed: 0.24, green: 0.27, blue: 0.30, alpha: 1)
+            : NSColor(srgbRed: 0.80, green: 0.82, blue: 0.85, alpha: 1)
+    }
+    private static let sourceSymbols = [
+        ("📝", "学習", "clock.arrow.circlepath"),
+        ("👤", "ユーザー", "person.crop.circle"),
+        ("🤖", "AI", "cpu"),
+        ("📚", "辞書", "book.closed"),
+        ("🔄", "変換", "arrow.triangle.2.circlepath"),
+        ("📅", "日付", "calendar"),
+    ]
 
     private let panel: NSPanel
     private let stackView: NSStackView
@@ -45,8 +67,8 @@ class CandidateWindowController {
         background.contentViewMargins = .zero
         background.cornerRadius = 14
         background.borderWidth = 1
-        background.borderColor = .separatorColor
-        background.fillColor = .windowBackgroundColor
+        background.borderColor = Self.borderColor
+        background.fillColor = Self.backgroundColor
         panel.contentView = background
 
         stackView = NSStackView()
@@ -140,25 +162,19 @@ class CandidateWindowController {
 
     private func addCandidateRow(_ candidate: CandidateItem, number: Int, selected: Bool) {
         let numberLabel = NSTextField(labelWithString: "\(number)")
-        numberLabel.font = NSFont.systemFont(ofSize: Self.badgeFontSize, weight: .semibold)
+        numberLabel.font = NSFont.systemFont(ofSize: Self.numberFontSize)
         numberLabel.alignment = .center
-        numberLabel.textColor = selected ? .white : NSColor.labelColor
+        numberLabel.textColor = selected ? .labelColor : .secondaryLabelColor
         numberLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        let badge = NSBox()
-        badge.boxType = .custom
-        badge.titlePosition = .noTitle
-        badge.contentViewMargins = .zero
-        badge.borderWidth = 0
-        badge.cornerRadius = 6
-        badge.fillColor = selected ? Self.accentColor : .quaternaryLabelColor
-        badge.translatesAutoresizingMaskIntoConstraints = false
-        badge.addSubview(numberLabel)
+        let numberColumn = NSView()
+        numberColumn.translatesAutoresizingMaskIntoConstraints = false
+        numberColumn.addSubview(numberLabel)
         NSLayoutConstraint.activate([
-            badge.widthAnchor.constraint(equalToConstant: 24),
-            badge.heightAnchor.constraint(equalToConstant: 24),
-            numberLabel.centerXAnchor.constraint(equalTo: badge.centerXAnchor),
-            numberLabel.centerYAnchor.constraint(equalTo: badge.centerYAnchor),
+            numberColumn.widthAnchor.constraint(equalToConstant: 24),
+            numberColumn.heightAnchor.constraint(equalToConstant: 21),
+            numberLabel.centerXAnchor.constraint(equalTo: numberColumn.centerXAnchor),
+            numberLabel.centerYAnchor.constraint(equalTo: numberColumn.centerYAnchor),
         ])
 
         let text = NSMutableAttributedString(
@@ -184,7 +200,7 @@ class CandidateWindowController {
         candidateLabel.alignment = .left
         candidateLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
 
-        let row = NSStackView(views: [badge, candidateLabel])
+        let row = NSStackView(views: [numberColumn, candidateLabel])
         row.translatesAutoresizingMaskIntoConstraints = false
         row.orientation = .horizontal
         row.alignment = .centerY
@@ -194,9 +210,9 @@ class CandidateWindowController {
         row.wantsLayer = true
         row.layer?.cornerRadius = 8
         row.layer?.masksToBounds = true
-        row.layer?.backgroundColor = selected
-            ? Self.accentColor.withAlphaComponent(0.10).cgColor
-            : NSColor.clear.cgColor
+        panel.effectiveAppearance.performAsCurrentDrawingAppearance {
+            row.layer?.backgroundColor = selected ? Self.selectionColor.cgColor : NSColor.clear.cgColor
+        }
         stackView.addArrangedSubview(row)
         row.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -16).isActive = true
         rowViews.append(row)
@@ -213,14 +229,53 @@ class CandidateWindowController {
     }
 
     private func addFooterLabel(_ text: String) {
-        let label = NSTextField(labelWithString: text)
-        label.font = NSFont.systemFont(ofSize: Self.footerFontSize)
-        label.textColor = NSColor.secondaryLabelColor
+        let label = NSTextField(labelWithAttributedString: Self.styledFooter(text))
         label.translatesAutoresizingMaskIntoConstraints = false
         label.setContentCompressionResistancePriority(.required, for: .horizontal)
         stackView.addArrangedSubview(label)
         label.widthAnchor.constraint(equalTo: stackView.widthAnchor, constant: -16).isActive = true
         rowViews.append(label)
+    }
+
+    private static func styledFooter(_ text: String) -> NSAttributedString {
+        var text = text
+        if text.hasPrefix("⚡") {
+            text.removeFirst()
+            text = text.trimmingCharacters(in: .whitespaces)
+        }
+        let source = text as NSString
+        var symbols: [(NSRange, String, String)] = []
+        // Match engine metadata tokens, preserving emoji in the user's reading and context.
+        for (emoji, label, symbol) in sourceSymbols {
+            for token in ["[変換:\(emoji)]", "| \(emoji) \(label)"] {
+                let tokenRange = source.range(of: token, options: .backwards)
+                if tokenRange.location != NSNotFound {
+                    symbols.append((source.range(of: emoji, range: tokenRange), symbol, label))
+                }
+            }
+        }
+        if text.hasPrefix("[☺]") {
+            symbols.append((source.range(of: "☺"), "face.smiling", "絵文字入力"))
+        }
+        if text.contains("[変換"), text.contains(" | 推論:") {
+            let range = source.range(of: " 🎯 ")
+            if range.location != NSNotFound {
+                symbols.append((source.range(of: "🎯", range: range), "scope", "変換範囲"))
+            }
+        }
+        let font = NSFont.systemFont(ofSize: footerFontSize)
+        let result = NSMutableAttributedString(
+            string: text, attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor])
+        let configuration = NSImage.SymbolConfiguration(pointSize: footerFontSize, weight: .regular)
+            .applying(NSImage.SymbolConfiguration(paletteColors: [.secondaryLabelColor]))
+        for (range, symbol, description) in symbols.sorted(by: { $0.0.location > $1.0.location }) {
+            let attachment = NSTextAttachment()
+            attachment.image = NSImage(systemSymbolName: symbol, accessibilityDescription: description)?
+                .withSymbolConfiguration(configuration)
+            attachment.bounds = NSRect(x: 0, y: -2, width: footerFontSize, height: footerFontSize)
+            result.replaceCharacters(in: range, with: NSAttributedString(attachment: attachment))
+        }
+        return result
     }
 
     private var lastCursorRect: NSRect = .zero
