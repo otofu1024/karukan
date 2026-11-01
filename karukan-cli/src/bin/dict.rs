@@ -172,7 +172,7 @@ async fn api_search(
                 .iter()
                 .map(|c| SearchResult {
                     reading: result.reading.to_string(),
-                    surface: c.surface.clone(),
+                    surface: c.surface.to_string(),
                     score: c.score,
                 })
                 .collect(),
@@ -185,7 +185,7 @@ async fn api_search(
             .flat_map(|result| {
                 result.candidates.iter().map(move |c| SearchResult {
                     reading: result.reading.to_string(),
-                    surface: c.surface.clone(),
+                    surface: c.surface.to_string(),
                     score: c.score,
                 })
             })

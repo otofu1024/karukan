@@ -28,18 +28,18 @@ use crate::kana::katakana_to_hiragana;
 const MAGIC: &[u8; 4] = b"KRKN";
 const VERSION: u32 = 1;
 
-/// A candidate surface form with its score.
+/// A candidate surface form with its score, stored without growable-string capacity.
 #[derive(Debug, Clone)]
 pub struct Candidate {
-    pub surface: String,
+    pub surface: Box<str>,
     pub score: f32,
 }
 
-/// A dictionary entry mapping a reading to its candidate surfaces.
+/// A dictionary entry with fixed-size reading and candidate storage.
 #[derive(Debug, Clone)]
 pub struct DictEntry {
-    pub reading: String,
-    pub candidates: Vec<Candidate>,
+    pub reading: Box<str>,
+    pub candidates: Box<[Candidate]>,
 }
 
 /// Result of a dictionary lookup, borrowing from the Dictionary.
@@ -115,12 +115,12 @@ impl Dictionary {
         let mut entries: Vec<DictEntry> = json_entries
             .into_iter()
             .map(|je| DictEntry {
-                reading: katakana_to_hiragana(&je.reading),
+                reading: katakana_to_hiragana(&je.reading).into_boxed_str(),
                 candidates: je
                     .candidates
                     .into_iter()
                     .map(|jc| Candidate {
-                        surface: jc.surface,
+                        surface: jc.surface.into_boxed_str(),
                         score: jc.score,
                     })
                     .collect(),
@@ -175,7 +175,7 @@ impl Dictionary {
             w.write_all(reading_bytes)?;
 
             w.write_all(&(entry.candidates.len() as u16).to_le_bytes())?;
-            for cand in &entry.candidates {
+            for cand in entry.candidates.iter() {
                 let surface_bytes = cand.surface.as_bytes();
                 w.write_all(&(surface_bytes.len() as u16).to_le_bytes())?;
                 w.write_all(surface_bytes)?;
@@ -258,13 +258,16 @@ impl Dictionary {
 
                 r.read_exact(&mut buf4)?;
                 let score = f32::from_le_bytes(buf4);
-                candidates.push(Candidate { surface, score });
+                candidates.push(Candidate {
+                    surface: surface.into_boxed_str(),
+                    score,
+                });
             }
 
             candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
             entries.push(DictEntry {
-                reading,
-                candidates,
+                reading: reading.into_boxed_str(),
+                candidates: candidates.into_boxed_slice(),
             });
         }
 
@@ -302,7 +305,7 @@ impl Dictionary {
         }
         let pool: Vec<&DictEntry> = self
             .entries_with_prefix(prefix)
-            .filter(|(_, e)| e.reading != prefix)
+            .filter(|(_, e)| e.reading.as_ref() != prefix)
             .map(|(_, e)| e)
             .collect();
         Self::rank_predictive(pool, prefix.chars().count(), limit)
@@ -340,7 +343,7 @@ impl Dictionary {
     ) -> impl Iterator<Item = (usize, &'s DictEntry)> + 's {
         let start = self
             .entries
-            .partition_point(|e| e.reading.as_str() < prefix);
+            .partition_point(|e| e.reading.as_ref() < prefix);
         let prefix = prefix.to_string();
         self.entries[start..]
             .iter()
@@ -395,7 +398,7 @@ impl Dictionary {
     /// Returns the total number of entries written.
     pub fn dump_all(&self, writer: &mut dyn std::io::Write) -> std::io::Result<usize> {
         for entry in &self.entries {
-            for cand in &entry.candidates {
+            for cand in entry.candidates.iter() {
                 writeln!(
                     writer,
                     "{}\t{}\t{}",
@@ -412,9 +415,13 @@ impl Dictionary {
     pub fn search_by_surface(&self, query: &str) -> Vec<(String, String, f32)> {
         let mut results = Vec::new();
         for entry in &self.entries {
-            for cand in &entry.candidates {
+            for cand in entry.candidates.iter() {
                 if cand.surface.contains(query) {
-                    results.push((entry.reading.clone(), cand.surface.clone(), cand.score));
+                    results.push((
+                        entry.reading.to_string(),
+                        cand.surface.to_string(),
+                        cand.score,
+                    ));
                 }
             }
         }
@@ -468,11 +475,11 @@ impl Dictionary {
             .into_iter()
             .filter_map(|reading| {
                 groups.remove(&reading).map(|surfaces| DictEntry {
-                    reading,
+                    reading: reading.into_boxed_str(),
                     candidates: surfaces
                         .into_iter()
                         .map(|surface| Candidate {
-                            surface,
+                            surface: surface.into_boxed_str(),
                             score: 0.0,
                         })
                         .collect(),
@@ -482,17 +489,6 @@ impl Dictionary {
 
         // Sort by reading bytes for the trie builder
         entries.sort_by(|a, b| a.reading.as_bytes().cmp(b.reading.as_bytes()));
-
-        // Deduplicate entries with the same reading (keep the first occurrence)
-        entries.dedup_by(|b, a| {
-            if a.reading == b.reading {
-                // Merge candidates from b into a
-                extend_candidates_unique(&mut a.candidates, std::mem::take(&mut b.candidates));
-                true
-            } else {
-                false
-            }
-        });
 
         Self::build_from_entries(entries)
     }
@@ -526,8 +522,8 @@ impl Dictionary {
         }
 
         // Collect all entries, grouped by reading
-        let mut merged: HashMap<String, Vec<Candidate>> = HashMap::new();
-        let mut reading_order: Vec<String> = Vec::new();
+        let mut merged: HashMap<Box<str>, Vec<Candidate>> = HashMap::new();
+        let mut reading_order: Vec<Box<str>> = Vec::new();
 
         for dict in dicts {
             for entry in dict.entries {
@@ -544,7 +540,7 @@ impl Dictionary {
             .filter_map(|reading| {
                 merged.remove(&reading).map(|candidates| DictEntry {
                     reading,
-                    candidates,
+                    candidates: candidates.into_boxed_slice(),
                 })
             })
             .collect();
@@ -700,6 +696,12 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    #[test]
+    fn test_compact_storage_layout() {
+        assert!(size_of::<Candidate>() < size_of::<(String, f32)>());
+        assert!(size_of::<DictEntry>() < size_of::<(String, Vec<Candidate>)>());
+    }
+
     fn create_test_json() -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
         // Note: readings are in katakana (as they come from the JSON)
@@ -735,9 +737,17 @@ mod tests {
         let dict = Dictionary::build_from_json(json_file.path()).unwrap();
 
         // Readings should be converted to hiragana
-        assert!(dict.entries.iter().any(|e| e.reading == "きょう"));
-        assert!(dict.entries.iter().any(|e| e.reading == "きょうと"));
-        assert!(dict.entries.iter().any(|e| e.reading == "とうきょう"));
+        assert!(dict.entries.iter().any(|e| e.reading.as_ref() == "きょう"));
+        assert!(
+            dict.entries
+                .iter()
+                .any(|e| e.reading.as_ref() == "きょうと")
+        );
+        assert!(
+            dict.entries
+                .iter()
+                .any(|e| e.reading.as_ref() == "とうきょう")
+        );
     }
 
     #[test]
@@ -749,9 +759,9 @@ mod tests {
         assert_eq!(result.reading, "きょう");
         assert_eq!(result.candidates.len(), 2);
         // Candidates should be sorted by score ascending
-        assert_eq!(result.candidates[0].surface, "京");
+        assert_eq!(result.candidates[0].surface.as_ref(), "京");
         assert!((result.candidates[0].score - 0.8).abs() < f32::EPSILON);
-        assert_eq!(result.candidates[1].surface, "今日");
+        assert_eq!(result.candidates[1].surface.as_ref(), "今日");
         assert!((result.candidates[1].score - 1.5).abs() < f32::EPSILON);
 
         assert!(dict.exact_match_search("きょうとふ").is_none());
@@ -780,7 +790,7 @@ mod tests {
         let matches = dict.predictive_search("わせ", 10);
         let surfaces: Vec<&str> = matches
             .iter()
-            .map(|m| m.candidate.surface.as_str())
+            .map(|m| m.candidate.surface.as_ref())
             .collect();
         // Exact わせ excluded; common long completion beats rare short one
         assert_eq!(surfaces, ["和船", "早稲田大学", "早稲田"]);
@@ -789,7 +799,7 @@ mod tests {
         // Limit caps the ranked result
         let top = dict.predictive_search("わせ", 1);
         assert_eq!(top.len(), 1);
-        assert_eq!(top[0].candidate.surface, "和船");
+        assert_eq!(top[0].candidate.surface.as_ref(), "和船");
 
         assert!(dict.predictive_search("", 10).is_empty());
         assert!(dict.predictive_search("わせだだいがくいん", 10).is_empty());
@@ -816,7 +826,7 @@ mod tests {
         let matches = dict.predictive_search_expanded("わせ", &expansions, 10);
         let surfaces: Vec<&str> = matches
             .iter()
-            .map(|m| m.candidate.surface.as_str())
+            .map(|m| m.candidate.surface.as_ref())
             .collect();
         assert_eq!(surfaces, ["早稲田", "早稲田大学"]);
 
@@ -855,7 +865,7 @@ mod tests {
         let result = loaded.exact_match_search("きょう").unwrap();
         assert_eq!(result.reading, "きょう");
         assert_eq!(result.candidates.len(), 2);
-        assert_eq!(result.candidates[0].surface, "京");
+        assert_eq!(result.candidates[0].surface.as_ref(), "京");
         assert!((result.candidates[0].score - 0.8).abs() < f32::EPSILON);
 
         let results = loaded.common_prefix_search("きょうと");
@@ -999,13 +1009,13 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         // Check exact match
         let result = dict.exact_match_search("きょう").unwrap();
         assert_eq!(result.candidates.len(), 2);
-        assert_eq!(result.candidates[0].surface, "今日");
-        assert_eq!(result.candidates[1].surface, "京");
+        assert_eq!(result.candidates[0].surface.as_ref(), "今日");
+        assert_eq!(result.candidates[1].surface.as_ref(), "京");
         assert!((result.candidates[0].score - 0.0).abs() < f32::EPSILON);
 
         let result = dict.exact_match_search("きょうと").unwrap();
         assert_eq!(result.candidates.len(), 1);
-        assert_eq!(result.candidates[0].surface, "京都");
+        assert_eq!(result.candidates[0].surface.as_ref(), "京都");
     }
 
     #[test]
@@ -1022,7 +1032,9 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         let dict = Dictionary::build_from_mozc_tsv(f.path()).unwrap();
         assert_eq!(dict.entries.len(), 1);
         assert_eq!(
-            dict.exact_match_search("きょう").unwrap().candidates[0].surface,
+            dict.exact_match_search("きょう").unwrap().candidates[0]
+                .surface
+                .as_ref(),
             "今日"
         );
     }
@@ -1040,8 +1052,8 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         let result = dict.exact_match_search("きょう").unwrap();
         // "今日" should appear only once (deduplicated)
         assert_eq!(result.candidates.len(), 2);
-        assert_eq!(result.candidates[0].surface, "今日");
-        assert_eq!(result.candidates[1].surface, "京");
+        assert_eq!(result.candidates[0].surface.as_ref(), "今日");
+        assert_eq!(result.candidates[1].surface.as_ref(), "京");
     }
 
     #[test]
@@ -1066,7 +1078,7 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         let dict = Dictionary::load_auto(tsv_file.path()).unwrap();
         let result = dict.exact_match_search("きょう").unwrap();
         assert_eq!(result.candidates.len(), 2);
-        assert_eq!(result.candidates[0].surface, "今日");
+        assert_eq!(result.candidates[0].surface.as_ref(), "今日");
     }
 
     #[test]
@@ -1090,8 +1102,8 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         // "きょう" should have candidates from both, dict1 first
         let result = merged.exact_match_search("きょう").unwrap();
         assert_eq!(result.candidates.len(), 2);
-        assert_eq!(result.candidates[0].surface, "今日");
-        assert_eq!(result.candidates[1].surface, "教");
+        assert_eq!(result.candidates[0].surface.as_ref(), "今日");
+        assert_eq!(result.candidates[1].surface.as_ref(), "教");
 
         // "きょうと" from dict1
         assert!(merged.exact_match_search("きょうと").is_some());
