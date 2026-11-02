@@ -27,6 +27,8 @@ chrono.workspace = true
 # llama.cpp bindings for GGUF inference
 llama-cpp-2 = "0.1"
 yada = "0.7"
+memmap2 = "0.9.12"
+tempfile.workspace = true
 
 # HuggingFace model download
 hf-hub = { version = "1.0", features = ["blocking"] }
@@ -39,7 +41,6 @@ tokenizers = "0.23"
 
 [dev-dependencies]
 criterion = "0.8"
-tempfile.workspace = true
 
 [[bench]]
 name = "inference_bench"

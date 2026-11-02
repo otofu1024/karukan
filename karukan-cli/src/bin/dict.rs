@@ -183,7 +183,7 @@ async fn api_search(
             .common_prefix_search(&query)
             .into_iter()
             .flat_map(|result| {
-                result.candidates.iter().map(move |c| SearchResult {
+                result.candidates.into_iter().map(move |c| SearchResult {
                     reading: result.reading.to_string(),
                     surface: c.surface.to_string(),
                     score: c.score,
@@ -271,7 +271,7 @@ async fn run_view(
                 eprintln!("No entries found with reading prefix \"{}\"", query);
             } else {
                 for result in &results {
-                    for cand in result.candidates {
+                    for cand in &result.candidates {
                         println!("{}\t{}\t{}", result.reading, cand.surface, cand.score);
                     }
                 }
@@ -280,7 +280,7 @@ async fn run_view(
         } else {
             match dict.exact_match_search(query) {
                 Some(result) => {
-                    for cand in result.candidates {
+                    for cand in &result.candidates {
                         println!("{}\t{}\t{}", result.reading, cand.surface, cand.score);
                     }
                     eprintln!("({} candidates)", result.candidates.len());

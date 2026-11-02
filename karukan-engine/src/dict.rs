@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
+use memmap2::Mmap;
 use unicode_normalization::UnicodeNormalization;
 
 /// Errors that can occur during dictionary operations.
@@ -42,24 +43,25 @@ pub struct DictEntry {
     pub candidates: Box<[Candidate]>,
 }
 
-/// Result of a dictionary lookup, borrowing from the Dictionary.
+/// A dictionary lookup with a borrowed reading and only the matching candidates decoded.
 #[derive(Debug)]
 pub struct LookupResult<'a> {
     pub reading: &'a str,
-    pub candidates: &'a [Candidate],
+    pub candidates: Vec<Candidate>,
 }
 
 /// A predictive match: a candidate whose reading extends the searched prefix.
 #[derive(Debug)]
 pub struct PredictiveMatch<'a> {
     pub reading: &'a str,
-    pub candidate: &'a Candidate,
+    pub candidate: Candidate,
 }
 
-/// A double-array trie dictionary for kana-kanji conversion.
+/// An immutable binary dictionary with a double-array trie and a compact entry index.
 pub struct Dictionary {
-    trie: DoubleArray<Vec<u8>>,
-    entries: Vec<DictEntry>,
+    data: Mmap,
+    trie_end: usize,
+    entry_offsets: Box<[usize]>,
 }
 
 // JSON deserialization types
@@ -81,7 +83,7 @@ impl Dictionary {
     /// Entries must already be sorted by `reading` bytes and deduplicated.
     /// This is the shared final step for all dictionary builders; it also
     /// sorts each entry's candidates by score ascending, the invariant
-    /// every lookup relies on (`load` enforces the same on read).
+    /// every lookup relies on (binary lookups enforce the same on read).
     fn build_from_entries(mut entries: Vec<DictEntry>) -> Result<Self> {
         for entry in &mut entries {
             entry.candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
@@ -95,11 +97,29 @@ impl Dictionary {
         let trie_bytes = DoubleArrayBuilder::build(&keyset)
             .map_err(|e| DictError::Format(format!("failed to build double-array trie: {e}")))?;
 
-        Ok(Dictionary {
-            trie: DoubleArray::new(trie_bytes)
-                .map_err(|e| DictError::Format(format!("invalid double-array trie: {e}")))?,
-            entries,
-        })
+        let mut snapshot = tempfile::tempfile()?;
+        {
+            let mut w = BufWriter::new(&mut snapshot);
+            w.write_all(MAGIC)?;
+            w.write_all(&VERSION.to_le_bytes())?;
+            w.write_all(&(trie_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(&trie_bytes)?;
+            w.write_all(&(entries.len() as u32).to_le_bytes())?;
+            for entry in &entries {
+                write_string(&mut w, &entry.reading)?;
+                let count = u16::try_from(entry.candidates.len())
+                    .map_err(|_| DictError::Format("too many candidates for one reading".into()))?;
+                w.write_all(&count.to_le_bytes())?;
+                for candidate in entry.candidates.iter() {
+                    write_string(&mut w, &candidate.surface)?;
+                    w.write_all(&candidate.score.to_le_bytes())?;
+                }
+            }
+            w.flush()?;
+        }
+        drop(entries);
+        drop(trie_bytes);
+        Self::from_snapshot(snapshot)
     }
 
     /// Build a Dictionary from a JSON file.
@@ -155,160 +175,130 @@ impl Dictionary {
     ///     [4B] score (f32 LE)
     /// ```
     pub fn save(&self, path: impl AsRef<Path>) -> Result<()> {
-        let file = File::create(path.as_ref())?;
-        let mut w = BufWriter::new(file);
-
-        // Magic + version
-        w.write_all(MAGIC)?;
-        w.write_all(&VERSION.to_le_bytes())?;
-
-        // Trie data
-        let trie_bytes: &[u8] = &self.trie.0;
-        w.write_all(&(trie_bytes.len() as u32).to_le_bytes())?;
-        w.write_all(trie_bytes)?;
-
-        // Entries
-        w.write_all(&(self.entries.len() as u32).to_le_bytes())?;
-        for entry in &self.entries {
-            let reading_bytes = entry.reading.as_bytes();
-            w.write_all(&(reading_bytes.len() as u16).to_le_bytes())?;
-            w.write_all(reading_bytes)?;
-
-            w.write_all(&(entry.candidates.len() as u16).to_le_bytes())?;
-            for cand in entry.candidates.iter() {
-                let surface_bytes = cand.surface.as_bytes();
-                w.write_all(&(surface_bytes.len() as u16).to_le_bytes())?;
-                w.write_all(surface_bytes)?;
-                w.write_all(&cand.score.to_le_bytes())?;
-            }
-        }
-
-        w.flush()?;
+        File::create(path)?.write_all(&self.data)?;
         Ok(())
     }
 
-    /// Load a dictionary from a binary file.
+    /// Load an immutable, file-backed snapshot without expanding every entry.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
-        let file = File::open(path.as_ref())?;
-        let mut r = BufReader::new(file);
+        let mut snapshot = tempfile::tempfile()?;
+        std::io::copy(&mut File::open(path)?, &mut snapshot)?;
+        Self::from_snapshot(snapshot)
+    }
 
-        // Magic
-        let mut magic = [0u8; 4];
-        r.read_exact(&mut magic)?;
-        if &magic != MAGIC {
-            return Err(DictError::Format(
-                "invalid magic: expected KRKN".to_string(),
-            ));
+    fn from_snapshot(snapshot: File) -> Result<Self> {
+        snapshot.sync_data()?;
+        // The private temporary file has no exposed path or surviving writable handle.
+        let data = unsafe { Mmap::map(&snapshot)? };
+        drop(snapshot);
+        let mut reader = BinaryReader::new(&data);
+        if reader.take(4)? != MAGIC {
+            return Err(DictError::Format("invalid magic: expected KRKN".into()));
         }
-
-        // Version
-        let mut buf4 = [0u8; 4];
-        r.read_exact(&mut buf4)?;
-        let version = u32::from_le_bytes(buf4);
+        let version = reader.u32()?;
         if version != VERSION {
             return Err(DictError::Format(format!("unsupported version: {version}")));
         }
-
-        // Trie
-        r.read_exact(&mut buf4)?;
-        let trie_len = u32::from_le_bytes(buf4) as usize;
-        const MAX_TRIE_LEN: usize = 100 * 1024 * 1024; // 100 MB
-        if trie_len > MAX_TRIE_LEN {
+        let trie_len = reader.u32()? as usize;
+        if trie_len > 100 * 1024 * 1024 {
+            return Err(DictError::Format(format!("trie_len too large: {trie_len}")));
+        }
+        DoubleArray::new(reader.take(trie_len)?)
+            .map_err(|e| DictError::Format(format!("invalid double-array trie: {e}")))?;
+        let trie_end = data.len() - reader.remaining.len();
+        let num_entries = reader.u32()? as usize;
+        if num_entries > 10_000_000 {
             return Err(DictError::Format(format!(
-                "trie_len too large: {} (max {})",
-                trie_len, MAX_TRIE_LEN
+                "num_entries too large: {num_entries}"
             )));
         }
-        let mut trie_bytes = vec![0u8; trie_len];
-        r.read_exact(&mut trie_bytes)?;
-
-        // Entries
-        r.read_exact(&mut buf4)?;
-        let num_entries = u32::from_le_bytes(buf4) as usize;
-        const MAX_ENTRIES: usize = 10_000_000;
-        if num_entries > MAX_ENTRIES {
-            return Err(DictError::Format(format!(
-                "num_entries too large: {} (max {})",
-                num_entries, MAX_ENTRIES
-            )));
+        if num_entries > reader.remaining.len() / 4 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into());
         }
-        let mut entries = Vec::with_capacity(num_entries);
-
-        let mut buf2 = [0u8; 2];
+        let mut entry_offsets = Vec::with_capacity(num_entries);
+        let mut previous = "";
         for _ in 0..num_entries {
-            // Reading
-            r.read_exact(&mut buf2)?;
-            let reading_len = u16::from_le_bytes(buf2) as usize;
-            let mut reading_bytes = vec![0u8; reading_len];
-            r.read_exact(&mut reading_bytes)?;
-            let reading = String::from_utf8(reading_bytes)
-                .map_err(|e| DictError::Format(format!("invalid UTF-8 in reading: {e}")))?;
-
-            // Candidates
-            r.read_exact(&mut buf2)?;
-            let num_candidates = u16::from_le_bytes(buf2) as usize;
-            let mut candidates = Vec::with_capacity(num_candidates);
-            for _ in 0..num_candidates {
-                r.read_exact(&mut buf2)?;
-                let surface_len = u16::from_le_bytes(buf2) as usize;
-                let mut surface_bytes = vec![0u8; surface_len];
-                r.read_exact(&mut surface_bytes)?;
-                let surface = String::from_utf8(surface_bytes)
-                    .map_err(|e| DictError::Format(format!("invalid UTF-8 in surface: {e}")))?;
-
-                r.read_exact(&mut buf4)?;
-                let score = f32::from_le_bytes(buf4);
-                candidates.push(Candidate {
-                    surface: surface.into_boxed_str(),
-                    score,
-                });
+            entry_offsets.push(data.len() - reader.remaining.len());
+            let reading = reader.string()?;
+            if reading < previous {
+                return Err(DictError::Format(
+                    "dictionary readings are not sorted".into(),
+                ));
             }
-
-            candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
-            entries.push(DictEntry {
-                reading: reading.into_boxed_str(),
-                candidates: candidates.into_boxed_slice(),
-            });
+            previous = reading;
+            let num_candidates = reader.u16()?;
+            for _ in 0..num_candidates {
+                reader.string()?;
+                reader.u32()?;
+            }
         }
+        Ok(Self {
+            data,
+            trie_end,
+            entry_offsets: entry_offsets.into_boxed_slice(),
+        })
+    }
 
-        Ok(Dictionary {
-            trie: DoubleArray::new(trie_bytes)
-                .map_err(|e| DictError::Format(format!("invalid double-array trie: {e}")))?,
-            entries,
+    fn trie(&self) -> DoubleArray<&[u8]> {
+        // Validated once on load; the private snapshot cannot change afterwards.
+        unsafe { DoubleArray::new_unchecked(&self.data[12..self.trie_end]) }
+    }
+
+    fn entry_reader(&self, index: usize) -> BinaryReader<'_> {
+        BinaryReader::new(&self.data[self.entry_offsets[index]..])
+    }
+
+    fn reading(&self, index: usize) -> &str {
+        self.entry_reader(index)
+            .string()
+            .expect("validated reading")
+    }
+
+    fn candidates(&self, index: usize) -> impl Iterator<Item = (&str, f32)> {
+        let mut reader = self.entry_reader(index);
+        reader.string().expect("validated reading");
+        let count = reader.u16().expect("validated candidate count");
+        (0..count).map(move |_| {
+            let surface = reader.string().expect("validated candidate");
+            let score = f32::from_bits(reader.u32().expect("validated score"));
+            (surface, score)
+        })
+    }
+
+    fn lookup(&self, index: usize) -> Option<LookupResult<'_>> {
+        self.entry_offsets.get(index)?;
+        let mut candidates: Vec<Candidate> = self
+            .candidates(index)
+            .map(|(surface, score)| Candidate {
+                surface: surface.into(),
+                score,
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+        Some(LookupResult {
+            reading: self.reading(index),
+            candidates,
         })
     }
 
     /// Common prefix search: returns all entries whose reading is a prefix of `input`.
     pub fn common_prefix_search(&self, input: &str) -> Vec<LookupResult<'_>> {
-        self.trie
+        self.trie()
             .common_prefix_search(input.as_bytes())
-            .filter_map(|(value, _len)| {
-                let entry = self.entries.get(value as usize)?;
-                Some(LookupResult {
-                    reading: &entry.reading,
-                    candidates: &entry.candidates,
-                })
-            })
+            .filter_map(|(value, _len)| self.lookup(value as usize))
             .collect()
     }
 
-    /// Predictive search: candidates whose reading strictly extends `prefix`
-    /// (a reading equal to `prefix` is excluded — that's `exact_match_search`).
-    ///
-    /// Ranked ascending by `score + 500·ln(50·remaining_chars)`: scores are
-    /// -500·log(p) costs, so demoting longer completions stays on the same
-    /// scale and a common long word can still beat a rare short one.
-    /// Relies on `entries` being sorted by reading (the build invariant).
+    /// Predictive search, ranked by cost plus a completion-length penalty.
     pub fn predictive_search(&self, prefix: &str, limit: usize) -> Vec<PredictiveMatch<'_>> {
         if prefix.is_empty() {
             return Vec::new();
         }
-        let pool: Vec<&DictEntry> = self
+        let pool = self
             .entries_with_prefix(prefix)
-            .filter(|(_, e)| e.reading.as_ref() != prefix)
-            .map(|(_, e)| e)
-            .collect();
-        Self::rank_predictive(pool, prefix.chars().count(), limit)
+            .filter(|(_, reading)| *reading != prefix)
+            .map(|(index, _)| index);
+        self.rank_predictive(pool, prefix.chars().count(), limit)
     }
 
     /// Predictive search narrowed by a still-unresolved romaji tail: the
@@ -326,101 +316,106 @@ impl Dictionary {
         let mut pool = Vec::new();
         for expansion in expansions {
             let prefix = format!("{base}{expansion}");
-            for (index, entry) in self.entries_with_prefix(&prefix) {
+            for (index, _) in self.entries_with_prefix(&prefix) {
                 if seen.insert(index) {
-                    pool.push(entry);
+                    pool.push(index);
                 }
             }
         }
-        Self::rank_predictive(pool, base.chars().count(), limit)
+        self.rank_predictive(pool, base.chars().count(), limit)
     }
 
-    /// Entries whose reading starts with `prefix`, with their indices.
-    /// Relies on `entries` being sorted by reading (the build invariant).
+    /// Entries whose reading starts with `prefix`, in dictionary order.
     fn entries_with_prefix<'s>(
         &'s self,
         prefix: &str,
-    ) -> impl Iterator<Item = (usize, &'s DictEntry)> + 's {
-        let start = self
-            .entries
-            .partition_point(|e| e.reading.as_ref() < prefix);
+    ) -> impl Iterator<Item = (usize, &'s str)> + 's {
+        let start = self.entry_offsets.partition_point(|&offset| {
+            BinaryReader::new(&self.data[offset..])
+                .string()
+                .expect("validated reading")
+                < prefix
+        });
         let prefix = prefix.to_string();
-        self.entries[start..]
-            .iter()
-            .enumerate()
-            .take_while(move |(_, e)| e.reading.starts_with(&prefix))
-            .map(move |(i, e)| (start + i, e))
+        (start..self.entry_offsets.len())
+            .map(move |index| (index, self.reading(index)))
+            .take_while(move |(_, reading)| reading.starts_with(&prefix))
     }
 
-    /// Rank predictive matches by `score + 500·ln(50·remaining_chars)`.
-    fn rank_predictive<'a>(
-        pool: Vec<&'a DictEntry>,
+    fn rank_predictive(
+        &self,
+        pool: impl IntoIterator<Item = usize>,
         base_chars: usize,
         limit: usize,
-    ) -> Vec<PredictiveMatch<'a>> {
+    ) -> Vec<PredictiveMatch<'_>> {
         if limit == 0 {
             return Vec::new();
         }
-        let mut ranked: Vec<(f32, PredictiveMatch<'a>)> = pool
+        let mut ranked: BinaryHeap<RankedCandidate<'_>> = BinaryHeap::new();
+        for (entry_order, index) in pool.into_iter().enumerate() {
+            let reading = self.reading(index);
+            let remaining = (reading.chars().count() - base_chars) as f32;
+            let penalty = 500.0 * (50.0 * remaining).ln();
+            for (candidate_order, (surface, score)) in self.candidates(index).enumerate() {
+                let candidate = RankedCandidate {
+                    rank: score + penalty,
+                    entry_order,
+                    candidate_order,
+                    reading,
+                    surface,
+                    score,
+                };
+                if ranked.len() < limit {
+                    ranked.push(candidate);
+                } else if candidate < *ranked.peek().unwrap() {
+                    *ranked.peek_mut().unwrap() = candidate;
+                }
+            }
+        }
+        ranked
+            .into_sorted_vec()
             .into_iter()
-            .flat_map(|entry| {
-                let remaining = (entry.reading.chars().count() - base_chars) as f32;
-                let penalty = 500.0 * (50.0 * remaining).ln();
-                entry.candidates.iter().map(move |candidate| {
-                    (
-                        candidate.score + penalty,
-                        PredictiveMatch {
-                            reading: &entry.reading,
-                            candidate,
-                        },
-                    )
-                })
+            .map(|item| PredictiveMatch {
+                reading: item.reading,
+                candidate: Candidate {
+                    surface: item.surface.into(),
+                    score: item.score,
+                },
             })
-            .collect();
-        ranked.sort_by(|a, b| a.0.total_cmp(&b.0));
-        ranked.truncate(limit);
-        ranked.into_iter().map(|(_, m)| m).collect()
+            .collect()
     }
 
     /// Exact match search: returns the entry whose reading exactly matches `input`.
     pub fn exact_match_search(&self, input: &str) -> Option<LookupResult<'_>> {
-        let value = self.trie.exact_match_search(input.as_bytes())?;
-        let entry = self.entries.get(value as usize)?;
-        Some(LookupResult {
-            reading: &entry.reading,
-            candidates: &entry.candidates,
-        })
+        self.lookup(self.trie().exact_match_search(input.as_bytes())? as usize)
     }
 
-    /// Write all entries in the dictionary to `writer` (for inspection/debugging).
-    ///
-    /// Each line is tab-separated: `reading\tsurface\tscore`.
-    /// Returns the total number of entries written.
+    /// Write all entries to `writer`, as `reading\tsurface\tscore`.
     pub fn dump_all(&self, writer: &mut dyn std::io::Write) -> std::io::Result<usize> {
-        for entry in &self.entries {
-            for cand in entry.candidates.iter() {
+        for index in 0..self.entry_offsets.len() {
+            let entry = self.lookup(index).expect("valid entry index");
+            for candidate in entry.candidates {
                 writeln!(
                     writer,
                     "{}\t{}\t{}",
-                    entry.reading, cand.surface, cand.score
+                    entry.reading, candidate.surface, candidate.score
                 )?;
             }
         }
-        Ok(self.entries.len())
+        Ok(self.entry_offsets.len())
     }
 
-    /// Search entries by surface form (substring match).
-    ///
-    /// Returns a list of (reading, surface, score) tuples where surface contains `query`.
+    /// Search entries by surface substring, returning reading, surface, score.
     pub fn search_by_surface(&self, query: &str) -> Vec<(String, String, f32)> {
         let mut results = Vec::new();
-        for entry in &self.entries {
-            for cand in entry.candidates.iter() {
-                if cand.surface.contains(query) {
+        for index in 0..self.entry_offsets.len() {
+            let entry = self.lookup(index).expect("valid entry index");
+            for candidate in entry.candidates {
+                if candidate.surface.contains(query) {
                     results.push((
                         entry.reading.to_string(),
-                        cand.surface.to_string(),
-                        cand.score,
+                        candidate.surface.into_string(),
+                        candidate.score,
                     ));
                 }
             }
@@ -526,11 +521,13 @@ impl Dictionary {
         let mut reading_order: Vec<Box<str>> = Vec::new();
 
         for dict in dicts {
-            for entry in dict.entries {
-                if !merged.contains_key(&entry.reading) {
-                    reading_order.push(entry.reading.clone());
+            for index in 0..dict.entry_offsets.len() {
+                let entry = dict.lookup(index).expect("valid entry index");
+                let reading: Box<str> = entry.reading.into();
+                if !merged.contains_key(&reading) {
+                    reading_order.push(reading.clone());
                 }
-                let candidates = merged.entry(entry.reading).or_default();
+                let candidates = merged.entry(reading).or_default();
                 extend_candidates_unique(candidates, entry.candidates);
             }
         }
@@ -550,6 +547,81 @@ impl Dictionary {
 
         Self::build_from_entries(entries).map(Some)
     }
+}
+
+struct BinaryReader<'a> {
+    remaining: &'a [u8],
+}
+
+impl<'a> BinaryReader<'a> {
+    fn new(remaining: &'a [u8]) -> Self {
+        Self { remaining }
+    }
+
+    fn take(&mut self, len: usize) -> Result<&'a [u8]> {
+        let bytes = self
+            .remaining
+            .get(..len)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        self.remaining = &self.remaining[len..];
+        Ok(bytes)
+    }
+
+    fn u16(&mut self) -> Result<u16> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn string(&mut self) -> Result<&'a str> {
+        let len = self.u16()? as usize;
+        std::str::from_utf8(self.take(len)?)
+            .map_err(|e| DictError::Format(format!("invalid dictionary UTF-8: {e}")))
+    }
+}
+
+struct RankedCandidate<'a> {
+    rank: f32,
+    entry_order: usize,
+    candidate_order: usize,
+    reading: &'a str,
+    surface: &'a str,
+    score: f32,
+}
+
+impl Ord for RankedCandidate<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // Preserve stable full-sort order even when score + penalty rounds to a tie.
+        self.rank
+            .total_cmp(&other.rank)
+            .then(self.entry_order.cmp(&other.entry_order))
+            .then(self.score.total_cmp(&other.score))
+            .then(self.candidate_order.cmp(&other.candidate_order))
+    }
+}
+
+impl PartialOrd for RankedCandidate<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedCandidate<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RankedCandidate<'_> {}
+
+fn write_string(writer: &mut impl Write, text: &str) -> Result<()> {
+    let len = u16::try_from(text.len())
+        .map_err(|_| DictError::Format("dictionary string exceeds 65535 bytes".into()))?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(text.as_bytes())?;
+    Ok(())
 }
 
 /// Append candidates to `dst`, skipping any whose surface is already present.
@@ -702,6 +774,196 @@ mod tests {
         assert!(size_of::<DictEntry>() < size_of::<(String, Vec<Candidate>)>());
     }
 
+    #[test]
+    fn test_snapshot_is_independent_of_source_file() {
+        let json = create_test_json();
+        let built = Dictionary::build_from_json(json.path()).unwrap();
+        let source = NamedTempFile::new().unwrap();
+        built.save(source.path()).unwrap();
+        let loaded = Dictionary::load(source.path()).unwrap();
+        File::create(source.path())
+            .unwrap()
+            .write_all(b"replaced")
+            .unwrap();
+        assert_eq!(
+            loaded.exact_match_search("きょう").unwrap().candidates[0]
+                .surface
+                .as_ref(),
+            "京"
+        );
+        loaded.save(source.path()).unwrap();
+        assert!(
+            Dictionary::load(source.path())
+                .unwrap()
+                .exact_match_search("とうきょう")
+                .is_some()
+        );
+        source.close().unwrap();
+        let candidates = loaded.exact_match_search("きょうと").unwrap().candidates;
+        drop(loaded);
+        assert_eq!(candidates[0].surface.as_ref(), "京都");
+    }
+
+    #[test]
+    fn test_binary_validation_before_lazy_lookup() {
+        fn load(bytes: &[u8]) -> Result<Dictionary> {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(bytes).unwrap();
+            Dictionary::from_snapshot(file)
+        }
+        let json = create_test_json();
+        let built = Dictionary::build_from_json(json.path()).unwrap();
+        let bytes = &built.data[..];
+        for len in [0, 1, 4, 8, 11, 12, bytes.len() - 1] {
+            assert!(
+                load(&bytes[..len]).is_err(),
+                "accepted truncated length {len}"
+            );
+        }
+        let trie_len = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let first_reading = 12 + trie_len + 4 + 2;
+        let reading_len =
+            u16::from_le_bytes(bytes[first_reading - 2..first_reading].try_into().unwrap())
+                as usize;
+        let first_surface = first_reading + reading_len + 2 + 2;
+        for position in [first_reading, first_surface] {
+            let mut invalid = bytes.to_vec();
+            invalid[position] = 0xff;
+            assert!(
+                load(&invalid).is_err(),
+                "accepted invalid UTF-8 at {position}"
+            );
+        }
+        let mut unsorted = bytes.to_vec();
+        unsorted[first_reading..first_reading + 3].copy_from_slice("ん".as_bytes());
+        assert!(load(&unsorted).is_err());
+        for (position, value) in [
+            (0, 0u32),
+            (4, 2u32),
+            (8, 100 * 1024 * 1024 + 1),
+            (12 + trie_len, 10_000_001),
+        ] {
+            let mut invalid = bytes.to_vec();
+            invalid[position..position + 4].copy_from_slice(&value.to_le_bytes());
+            assert!(load(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn test_binary_rejects_oversized_strings() {
+        let entries = vec![DictEntry {
+            reading: "あ".into(),
+            candidates: vec![Candidate {
+                surface: "あ".repeat(22_000).into_boxed_str(),
+                score: 0.0,
+            }]
+            .into_boxed_slice(),
+        }];
+        assert!(matches!(
+            Dictionary::build_from_entries(entries),
+            Err(DictError::Format(_))
+        ));
+    }
+
+    #[test]
+    fn test_unsorted_scores_keep_stable_predictive_ties() {
+        let built = Dictionary::build_from_entries(vec![DictEntry {
+            reading: "ああ".into(),
+            candidates: vec![
+                Candidate {
+                    surface: "先".into(),
+                    score: 0.0,
+                },
+                Candidate {
+                    surface: "後".into(),
+                    score: 0.0,
+                },
+            ]
+            .into_boxed_slice(),
+        }])
+        .unwrap();
+        let mut bytes = built.data.to_vec();
+        let score_offset = built.entry_offsets[0] + 2 + "ああ".len() + 2 + 2 + "先".len();
+        bytes[score_offset..score_offset + 4].copy_from_slice(&1e-7f32.to_le_bytes());
+        let mut snapshot = tempfile::tempfile().unwrap();
+        snapshot.write_all(&bytes).unwrap();
+        let loaded = Dictionary::from_snapshot(snapshot).unwrap();
+        assert_eq!(
+            loaded.exact_match_search("ああ").unwrap().candidates[0]
+                .surface
+                .as_ref(),
+            "後"
+        );
+        assert_eq!(
+            loaded.predictive_search("あ", 1)[0]
+                .candidate
+                .surface
+                .as_ref(),
+            "後"
+        );
+    }
+
+    #[test]
+    fn test_predictive_top_k_matches_stable_full_sort() {
+        let scores = [
+            1e-7,
+            0.0,
+            -0.0,
+            100.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            -f32::NAN,
+        ];
+        let mut entries: Vec<DictEntry> = (0..32)
+            .map(|i| DictEntry {
+                reading: format!("あ{i:02}").into_boxed_str(),
+                candidates: scores
+                    .iter()
+                    .enumerate()
+                    .map(|(j, &score)| Candidate {
+                        surface: format!("候補{i}-{j}").into_boxed_str(),
+                        score,
+                    })
+                    .collect(),
+            })
+            .collect();
+        let dict = Dictionary::build_from_entries(entries.clone()).unwrap();
+        let mut expected = Vec::new();
+        for entry in &mut entries {
+            entry.candidates.sort_by(|a, b| a.score.total_cmp(&b.score));
+            let penalty = 500.0 * (50.0 * (entry.reading.chars().count() - 1) as f32).ln();
+            for candidate in entry.candidates.iter() {
+                expected.push((
+                    candidate.score + penalty,
+                    entry.reading.to_string(),
+                    candidate.surface.to_string(),
+                    candidate.score.to_bits(),
+                ));
+            }
+        }
+        expected.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for limit in [0, 1, 9, 64, 1_000] {
+            let actual: Vec<_> = dict
+                .predictive_search("あ", limit)
+                .into_iter()
+                .map(|item| {
+                    (
+                        item.reading.to_string(),
+                        item.candidate.surface.into_string(),
+                        item.candidate.score.to_bits(),
+                    )
+                })
+                .collect();
+            let expected: Vec<_> = expected
+                .iter()
+                .take(limit)
+                .map(|item| (item.1.clone(), item.2.clone(), item.3))
+                .collect();
+            assert_eq!(actual, expected, "limit {limit}");
+        }
+    }
+
     fn create_test_json() -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();
         // Note: readings are in katakana (as they come from the JSON)
@@ -737,17 +999,9 @@ mod tests {
         let dict = Dictionary::build_from_json(json_file.path()).unwrap();
 
         // Readings should be converted to hiragana
-        assert!(dict.entries.iter().any(|e| e.reading.as_ref() == "きょう"));
-        assert!(
-            dict.entries
-                .iter()
-                .any(|e| e.reading.as_ref() == "きょうと")
-        );
-        assert!(
-            dict.entries
-                .iter()
-                .any(|e| e.reading.as_ref() == "とうきょう")
-        );
+        for reading in ["きょう", "きょうと", "とうきょう"] {
+            assert!(dict.exact_match_search(reading).is_some());
+        }
     }
 
     #[test]
@@ -1004,7 +1258,7 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         let dict = Dictionary::build_from_mozc_tsv(tsv_file.path()).unwrap();
 
         // Should have 3 readings
-        assert_eq!(dict.entries.len(), 3);
+        assert_eq!(dict.entry_offsets.len(), 3);
 
         // Check exact match
         let result = dict.exact_match_search("きょう").unwrap();
@@ -1030,7 +1284,7 @@ col0,col1,col2,4500,今日,col5,col6,col7,col8,col9,col10,キョウ
         f.flush().unwrap();
 
         let dict = Dictionary::build_from_mozc_tsv(f.path()).unwrap();
-        assert_eq!(dict.entries.len(), 1);
+        assert_eq!(dict.entry_offsets.len(), 1);
         assert_eq!(
             dict.exact_match_search("きょう").unwrap().candidates[0]
                 .surface
