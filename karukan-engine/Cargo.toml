@@ -28,6 +28,7 @@ chrono.workspace = true
 llama-cpp-2 = "0.1"
 yada = "0.7"
 memmap2 = "0.9.12"
+sha2 = "0.11"
 tempfile.workspace = true
 
 # HuggingFace model download

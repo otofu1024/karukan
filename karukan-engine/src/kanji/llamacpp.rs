@@ -15,10 +15,11 @@ use llama_cpp_2::model::LlamaModel;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
-use std::collections::HashSet;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, Weak};
 
 /// Global llama.cpp backend (can only be initialized once)
 static LLAMA_BACKEND: OnceLock<std::result::Result<LlamaBackend, String>> = OnceLock::new();
@@ -70,15 +71,30 @@ fn is_byte_fallback_token(token: &str) -> bool {
 }
 
 /// Load and configure an external HuggingFace tokenizer from a `tokenizer.json` file.
-fn load_tokenizer<P: AsRef<Path>>(path: P) -> Result<tokenizers::Tokenizer> {
+fn load_tokenizer<P: AsRef<Path>>(path: P) -> Result<Arc<tokenizers::Tokenizer>> {
+    let bytes = std::fs::read(path).map_err(|e| KanjiError::TokenizerLoad(e.into()))?;
+    let fingerprint: [u8; 32] = Sha256::digest(&bytes).into();
+    let mut cache = TOKENIZER_CACHE
+        .lock()
+        .map_err(|_| KanjiError::TokenizerLoad("tokenizer cache lock poisoned".into()))?;
+    cache.retain(|_, tokenizer| tokenizer.strong_count() > 0);
+    if let Some(tokenizer) = cache.get(&fingerprint).and_then(Weak::upgrade) {
+        return Ok(tokenizer);
+    }
     let mut tokenizer =
-        tokenizers::Tokenizer::from_file(path.as_ref()).map_err(KanjiError::TokenizerLoad)?;
+        tokenizers::Tokenizer::from_bytes(&bytes).map_err(KanjiError::TokenizerLoad)?;
     // Disable padding and truncation — we handle sequence length ourselves
     // and padding tokens would corrupt the model input.
     tokenizer.with_padding(None);
     tokenizer.with_truncation(None).ok();
+    let tokenizer = Arc::new(tokenizer);
+    cache.insert(fingerprint, Arc::downgrade(&tokenizer));
     Ok(tokenizer)
 }
+
+// Weak references let models release their tokenizer when they are unloaded.
+static TOKENIZER_CACHE: LazyLock<Mutex<HashMap<[u8; 32], Weak<tokenizers::Tokenizer>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// A beam candidate with generated tokens and cumulative score
 #[derive(Clone)]
@@ -93,7 +109,7 @@ pub struct LlamaCppModel {
     n_ctx: u32,
     /// External HuggingFace tokenizer (always required).
     /// `tokenize()` and `decode()` use this instead of llama.cpp's built-in tokenizer.
-    external_tokenizer: tokenizers::Tokenizer,
+    external_tokenizer: Arc<tokenizers::Tokenizer>,
     /// Token ids `decode(_, skip_special_tokens=true)` removes before
     /// detokenizing: added tokens with `special: true`, minus the
     /// byte-fallback tokens (see [`is_byte_fallback_token`]).
@@ -876,6 +892,119 @@ impl<'a> NllScorer<'a> {
 
         let n_chars = surface.chars().count().max(1);
         Ok(total_nll / n_chars as f32)
+    }
+}
+
+#[cfg(test)]
+mod tokenizer_sharing_tests {
+    use super::*;
+    use tokenizers::models::wordlevel::WordLevel;
+    use tokenizers::pre_tokenizers::whitespace::WhitespaceSplit;
+
+    fn fixture(tag: &str) -> tokenizers::Tokenizer {
+        let model = WordLevel::builder()
+            .vocab(
+                [
+                    ("[UNK]".to_string(), 0),
+                    ("hello".to_string(), 1),
+                    ("world".to_string(), 2),
+                    (tag.to_string(), 3),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .unk_token("[UNK]".into())
+            .build()
+            .unwrap();
+        let mut tokenizer = tokenizers::Tokenizer::new(model);
+        tokenizer.with_pre_tokenizer(Some(WhitespaceSplit));
+        tokenizer
+    }
+
+    #[test]
+    fn identical_files_share_until_the_last_model_releases_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_path = dir.path().join("main.json");
+        let second_path = dir.path().join("light.json");
+        fixture("shared-lifetime").save(&first_path, false).unwrap();
+        std::fs::copy(&first_path, &second_path).unwrap();
+        let first = load_tokenizer(first_path).unwrap();
+        let second = load_tokenizer(second_path).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert_eq!(
+            second.encode("hello world", false).unwrap().get_ids(),
+            &[1, 2]
+        );
+        drop(second);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn changed_and_invalid_contents_do_not_reuse_the_old_tokenizer() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fixture("changed-file").save(file.path(), false).unwrap();
+        let first = load_tokenizer(file.path()).unwrap();
+        let mut json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        json["model"]["vocab"]["hello"] = 2.into();
+        json["model"]["vocab"]["world"] = 1.into();
+        std::fs::write(file.path(), serde_json::to_vec(&json).unwrap()).unwrap();
+        let second = load_tokenizer(file.path()).unwrap();
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(first.encode("hello", false).unwrap().get_ids(), &[1]);
+        assert_eq!(second.encode("hello", false).unwrap().get_ids(), &[2]);
+        std::fs::write(file.path(), b"invalid tokenizer").unwrap();
+        assert!(matches!(
+            load_tokenizer(file.path()),
+            Err(KanjiError::TokenizerLoad(_))
+        ));
+    }
+
+    #[test]
+    fn shared_tokenizers_keep_padding_and_truncation_disabled() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut tokenizer = fixture("configured-file");
+        tokenizer.with_padding(Some(tokenizers::PaddingParams {
+            strategy: tokenizers::PaddingStrategy::Fixed(8),
+            ..Default::default()
+        }));
+        tokenizer
+            .with_truncation(Some(tokenizers::TruncationParams {
+                max_length: 1,
+                ..Default::default()
+            }))
+            .unwrap();
+        tokenizer.save(file.path(), false).unwrap();
+        let loaded = load_tokenizer(file.path()).unwrap();
+        assert!(loaded.get_padding().is_none());
+        assert!(loaded.get_truncation().is_none());
+        assert_eq!(
+            loaded.encode("hello world", false).unwrap().get_ids(),
+            &[1, 2]
+        );
+    }
+
+    #[test]
+    fn concurrent_loads_share_one_instance() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fixture("concurrent-file").save(file.path(), false).unwrap();
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let path = file.path().to_owned();
+                std::thread::spawn(move || load_tokenizer(path).unwrap())
+            })
+            .collect();
+        let tokenizers: Vec<_> = threads
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(
+            tokenizers
+                .iter()
+                .all(|tokenizer| Arc::ptr_eq(&tokenizers[0], tokenizer))
+        );
     }
 }
 
