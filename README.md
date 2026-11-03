@@ -1,4 +1,4 @@
-# Karukan IME（macOSカスタム版）
+# yuzukan IME
 
 [Karukan](https://github.com/togatoga/karukan) をベースにした、ローカルLLMでかな漢字変換するmacOS向け日本語IMEです。
 
@@ -9,15 +9,17 @@ Rustが変換処理、SwiftがmacOS連携とUI、llama.cppがCPUでモデル推�
 
 ## 導入
 
-macOS 13以降。HomebrewとXcode Command Line Toolsが必要です。
+macOS 13以降。Xcode Command Line Tools、Rust、CMakeが必要です。
+Rust 1.99.1で動作確認しています。
 
 ```sh
-brew install --cask otofu1024/tap/karukan
+git clone https://github.com/otofu1024/yuzukan.git
+cd yuzukan/karukan-im/macos
+make install
 ```
 
-Rust・CMakeを自動導入し、このMac向けにソースからビルドします。
-モデルと辞書も導入時に自動ダウンロードされます。
-初回はログアウト・再ログインし、システム設定の「キーボード」→「入力ソース」からKarukanを追加してください。
+モデルと辞書は導入時に自動ダウンロードされます。
+初回はログアウト・再ログインし、システム設定の「キーボード」→「入力ソース」からyuzukanを追加してください。
 
 ソースからの手動ビルド・設定方法は [macOS版README](karukan-im/macos/README.md) を参照してください。
 

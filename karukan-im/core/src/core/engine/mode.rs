@@ -25,7 +25,7 @@ impl InputMethodEngine {
         let preedit = self.set_composing_state();
 
         // Update aux text to show mode
-        let aux = format!("{} Karukan ({})", self.mode_indicator(), self.model_name());
+        let aux = format!("{} yuzukan ({})", self.mode_indicator(), self.model_name());
 
         EngineResult::consumed()
             .with_action(EngineAction::UpdatePreedit(preedit))

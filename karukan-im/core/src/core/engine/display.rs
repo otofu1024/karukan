@@ -249,7 +249,7 @@ impl InputMethodEngine {
         if !self.config.verbose {
             return format!("{indicator}{reading}");
         }
-        let model = format!(" Karukan ({})", self.model_name());
+        let model = format!(" yuzukan ({})", self.model_name());
         let ctx = Some(self.display_context_chunked())
             .filter(|c| !c.is_empty())
             .map(|c| format!(" | {c}"))

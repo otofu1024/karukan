@@ -1,5 +1,5 @@
 OUTDIR = out
-APP = $(OUTDIR)/Karukan.app
+APP = $(OUTDIR)/yuzukan.app
 INSTALL_DIR = $(HOME)/Library/Input Methods
 CARGO_MANIFEST = ../../Cargo.toml
 CARGO_TARGET = ../../target
@@ -72,11 +72,13 @@ install-models: build
 
 install: bundle install-dict install-models
 	mkdir -p "$(INSTALL_DIR)"
-	rm -rf "$(INSTALL_DIR)/Karukan.app"
+	rm -rf "$(INSTALL_DIR)/yuzukan.app"
 	cp -a $(APP) "$(INSTALL_DIR)/"
+	rm -rf "$(INSTALL_DIR)/Karukan.app"
 	-killall KarukanIME 2>/dev/null || true
-	@echo "Installed to $(INSTALL_DIR)/Karukan.app"
-	@echo "First install: log out and back in, then add Karukan in System Settings > Keyboard > Input Sources."
+	-open "$(INSTALL_DIR)/yuzukan.app"
+	@echo "Installed to $(INSTALL_DIR)/yuzukan.app"
+	@echo "First install: log out and back in, then add yuzukan in System Settings > Keyboard > Input Sources."
 
 fmt:
 	swift-format format -ri Sources/ Tests/
