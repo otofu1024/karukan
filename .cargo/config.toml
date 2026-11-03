@@ -1,3 +1,5 @@
 [env]
 # Models use CPU inference (n_gpu_layers = 0); skip unused Metal initialization.
 GGML_METAL = "OFF"
+# Keep model weights file-backed instead of allocating repacked CPU copies.
+GGML_CPU_REPACK = "OFF"
