@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 
 @testable import KarukanIME
@@ -72,6 +73,24 @@ final class TransportTests: XCTestCase {
             let data = client.sendRequestSync(method: "status", params: [:], timeout: 5.0)
             XCTAssertNotNil(data)
         }
+    }
+
+    func testReaderDoesNotAccumulateTemporaryData() throws {
+        func requestStatus() throws {
+            try autoreleasepool {
+                let data = client.sendRequestSync(method: "status", params: [:], timeout: 5.0)
+                _ = try XCTUnwrap(data)
+            }
+        }
+        for _ in 0..<50 { try requestStatus() }
+
+        // Count live allocations, allowing room for runtime caches and allocator variation.
+        var before = malloc_statistics_t()
+        malloc_zone_statistics(nil, &before)
+        for _ in 0..<1000 { try requestStatus() }
+        var after = malloc_statistics_t()
+        malloc_zone_statistics(nil, &after)
+        XCTAssertLessThan(Int64(after.size_in_use) - Int64(before.size_in_use), 8 * 1024 * 1024)
     }
 
     func testServerStopAndRestartRecovers() throws {
