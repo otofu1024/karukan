@@ -71,6 +71,7 @@ install-models: build
 		echo "WARNING: model prefetch failed; models will be downloaded on first launch"
 
 install: bundle install-dict install-models
+	mkdir -p "$(INSTALL_DIR)"
 	rm -rf "$(INSTALL_DIR)/Karukan.app"
 	cp -a $(APP) "$(INSTALL_DIR)/"
 	-killall KarukanIME 2>/dev/null || true
